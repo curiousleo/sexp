@@ -1,11 +1,9 @@
-{-# LANGUAGE OverloadedStrings, DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings, DeriveGeneric, FlexibleInstances #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Main where
 
-import Control.Applicative ( (<$>) )
 import Data.ByteString.Lazy.Char8 hiding ( map, concat )
-import Data.Monoid
 import Data.Sexp
 import GHC.Generics ( Generic )
 import Language.Sexp
@@ -22,8 +20,11 @@ import qualified Data.Set as S
 main :: IO ()
 main = defaultMainWithOpts tests options
   where
-    tests = (concat [parseTests, basicTypeTests, idTests, gTests])
+    tests = concat [parseTests, basicTypeTests, idTests, gTests]
     options = mempty { ropt_test_options = Just (mempty { topt_timeout = Just (Just 5000000) }) }
+
+instance MonadFail (Either String) where
+    fail = Left
 
 --------------------------------
 -- HUnit Tests
@@ -102,7 +103,7 @@ data Config = TcpConfig { useSSL :: Bool
 
 instance Sexpable Config
 
-data SingleConfig = SingleConfig { getConfig :: Int }
+newtype SingleConfig = SingleConfig { getConfig :: Int }
                   deriving ( Eq, Generic, Show )
 
 instance Sexpable SingleConfig
@@ -177,12 +178,10 @@ instance Arbitrary ReadableString where
         RS <$> sequence [ choose (' ', '~') | _ <- [1..n] ]
 
 instance Arbitrary Sexp where
-    arbitrary = sized $ \sz -> do
-        n <- choose (1, 2) :: Gen Int
-        case n of
-            1 -> (Atom . pack . unRS) <$> arbitrary
-            2 -> List <$> (resize (sz `div` 2) arbitrary)
-            _ -> fail "can't touch this"
+    arbitrary = sized $ \sz -> frequency
+        [ (1, Atom . pack . unRS <$> arbitrary)
+        , (1, List <$> resize (sz `div` 2) arbitrary)
+        ]
 
 idTests :: [Test]
 idTests =

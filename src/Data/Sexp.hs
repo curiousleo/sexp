@@ -2,7 +2,7 @@
 {-# LANGUAGE TypeSynonymInstances, FlexibleInstances, KindSignatures, TypeOperators #-}
 {-# LANGUAGE FunctionalDependencies, EmptyDataDecls, UndecidableInstances #-}
 --{-# LANGUAGE OverlappingInstances, ViewPatterns #-}
-{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE ViewPatterns, DataKinds #-}
 
 -- | S-Expressions are represented by 'Sexp'.  Conversion to and from arbitrary types is
 -- done through 'Sexpable'.
@@ -46,12 +46,11 @@ module Data.Sexp (
         escape, unescape
     ) where
 
-import Control.Applicative ( Applicative(..), Alternative(..), (<$>) )
+import Control.Applicative ( Alternative(..) )
 import Control.Monad.ST ( ST )
 import Data.Bits ( shiftR )
 import Data.ByteString.Lazy.Char8 ( ByteString )
 import Data.DList ( DList )
-import Data.Monoid ( Monoid(..) )
 import Data.String ( IsString(..) )
 import Data.Vector ( Vector )
 import GHC.Generics
@@ -64,6 +63,7 @@ import qualified Data.Map as M
 import qualified Data.Set as S
 import qualified Data.Vector as V
 import qualified Data.Vector.Mutable as VM
+import GHC.Show (showLitString)
 
 -- | A 'ByteString'-based S-Expression.  Conceptually, a 'Sexp' is
 -- either an single atom represented by a 'ByteString', or a list of
@@ -76,12 +76,12 @@ instance IsString Sexp where
 
 class Sexpable a where
     toSexp :: a -> Sexp
-    fromSexp :: (Monad m, Applicative m) => Sexp -> m a
+    fromSexp :: (Monad m, MonadFail m) => Sexp -> m a
 
     default toSexp :: (Generic a, GSexpable (Rep a)) => a -> Sexp
     toSexp = gToSexp . from
 
-    default fromSexp :: (Generic a, GSexpable (Rep a), Monad m, Applicative m) => Sexp -> m a
+    default fromSexp :: (Generic a, GSexpable (Rep a), Monad m, MonadFail m) => Sexp -> m a
     fromSexp s = to <$> gFromSexp s
 
 ----------------------
@@ -190,15 +190,18 @@ instance Sexpable Sexp where
 -- What is a record?
 ----------------------
 
-class IsRecord (f :: * -> *) b | f -> b
-
 data True
 data False
 
-instance (IsRecord f b) => IsRecord (f :*: g) b
-instance {-# OVERLAPPING #-} IsRecord (M1 S NoSelector f) False
-instance {-# OVERLAPPABLE #-} (IsRecord f b) => IsRecord (M1 S c f) b
+class IsRecord (f :: * -> *) isRecord | f -> isRecord
+
+instance (IsRecord f isRecord) => IsRecord (f :*: g) isRecord
+instance {-# OVERLAPPING #-} IsRecord (M1 S ('MetaSel 'Nothing u ss ds) f) False
+instance (IsRecord f isRecord) => IsRecord (M1 S c f) isRecord
 instance IsRecord (K1 i c) True
+instance IsRecord Par1 True
+instance IsRecord (Rec1 f) True
+instance IsRecord (f :.: g) True
 instance IsRecord U1 False
 
 ----------------------
@@ -221,7 +224,7 @@ instance (Selector s, GSexpable a) => GRecordToPairs (S1 s a) where
 ----------------------
 
 class GFromRecord f where
-    gFromRecord :: (Monad m, Applicative m) => [Sexp] -> m (f a)
+    gFromRecord :: (Monad m, MonadFail m) => [Sexp] -> m (f a)
 
 instance (GFromRecord a, GFromRecord b) => GFromRecord (a :*: b) where
     gFromRecord fs = (:*:) <$> gFromRecord fs <*> gFromRecord fs
@@ -243,17 +246,17 @@ instance (Selector s, GSexpable a) => GFromRecord (S1 s a) where
 
 class ConsSexpable f where
       consToSexp :: f a -> Sexp
-      consFromSexp :: (Monad m, Applicative m) => Sexp -> m (f a)
+      consFromSexp :: (Monad m, MonadFail m) => Sexp -> m (f a)
 
 class ConsSexpable' b f where
       consToSexp' :: Tagged b (f a -> Sexp)
-      consFromSexp' :: (Monad m, Applicative m) => Tagged b (Sexp -> m (f a))
+      consFromSexp' :: (Monad m, MonadFail m) => Tagged b (Sexp -> m (f a))
 
 newtype Tagged s b = Tagged { unTagged :: b }
 
 instance (IsRecord f b, ConsSexpable' b f) => ConsSexpable f where
     consToSexp = unTagged (consToSexp' :: Tagged b (f a -> Sexp))
-    consFromSexp = unTagged (consFromSexp' :: (Monad m, Applicative m) => Tagged b (Sexp -> m (f a)))
+    consFromSexp = unTagged (consFromSexp' :: (Monad m, MonadFail m) => Tagged b (Sexp -> m (f a)))
 
 instance (GRecordToPairs f, GFromRecord f) => ConsSexpable' True f where
     consToSexp' = Tagged (List . map (\(n, s) -> List [Atom n, s]) . DL.toList . gRecordToPairs)
@@ -287,7 +290,7 @@ instance ProductSize (S1 s a) where
 ----------------------
 
 class GFromProduct f where
-    gFromProduct :: (Monad m, Applicative m) => Vector Sexp -> Int -> Int -> m (f a)
+    gFromProduct :: (Monad m, MonadFail m) => Vector Sexp -> Int -> Int -> m (f a)
 
 instance (GFromProduct a, GFromProduct b) => GFromProduct (a :*: b) where
     gFromProduct arr ix len = (:*:) <$> gFromProduct arr ix lenL
@@ -320,7 +323,7 @@ instance {-# OVERLAPPABLE #-} (GSexpable a) => GProductToSexp a where
 ----------------------
 
 class GFromSum f where
-    gFromSum :: (Monad m, Applicative m) => Pair -> Maybe (m (f a))
+    gFromSum :: (Monad m, MonadFail m) => Pair -> Maybe (m (f a))
 
 instance (GFromSum a, GFromSum b) => GFromSum (a :+: b) where
     gFromSum keyVal = (fmap L1 <$> gFromSum keyVal) <|>
@@ -347,7 +350,7 @@ instance (Constructor c, GSexpable a, ConsSexpable a) => GToSum (C1 c a) where
 
 class GSexpable f where
     gToSexp :: f a -> Sexp
-    gFromSexp :: (Monad m, Applicative m) => Sexp -> m (f a)
+    gFromSexp :: (Monad m, MonadFail m) => Sexp -> m (f a)
 
 instance {-# OVERLAPPABLE #-} (GSexpable a) => GSexpable (M1 i c a) where
     gToSexp = gToSexp . unM1
@@ -407,7 +410,7 @@ instance ( GToSum a, GToSum b
 -- | Escape @"@ and @\@ in the given string.  This needs to be done
 -- for double-quoted atoms (e.g. @"\"Hello\", he said"@).
 escape :: ByteString -> ByteString
-escape = BL.concatMap escapeChar
+escape = id -- BL.concatMap escapeChar
   where
     escapeChar '\\' = "\\\\"
     escapeChar '"'  = "\\\""
@@ -415,7 +418,7 @@ escape = BL.concatMap escapeChar
 
 -- | The inverse of 'escape'.
 unescape :: ByteString -> ByteString
-unescape = BL.reverse . BL.pack . snd . (BL.foldl' unescapeChar (False, []))
+unescape = id -- BL.reverse . BL.pack . snd . (BL.foldl' unescapeChar (False, []))
   where
     unescapeChar :: (Bool, [Char]) -> Char -> (Bool, [Char])
     unescapeChar (False, cs) '\\' = (True, cs)
@@ -427,7 +430,7 @@ showToSexp :: (Show a) => a -> Sexp
 showToSexp = Atom . BL.pack . show
 
 -- | The inverse of 'showToSexp'.
-readFromSexp :: (Read a, Monad m, Applicative m) => Sexp -> m a
+readFromSexp :: (Read a, Monad m, MonadFail m) => Sexp -> m a
 readFromSexp (Atom s) =
     case readsPrec 1 (BL.unpack s) of
         [(n, _)] -> return n
